@@ -831,5 +831,656 @@ int main() {
 * 使用 `ranges` 處理角色道具過濾與排序（如血量最低者、自動選擇武器）
 * 具備簡易 CLI 視覺輸出（如角色狀態條、技能清單）
 
+# Chapter 10: C++20 協程（Coroutines）與 Generator
 
-是否要繼續第九章：C++20 的協程（coroutines）與 generator？
+本章將介紹 C++20 協程的基本概念與應用，並使用 `co_yield` 實作 generator。
+
+---
+
+## 一、協程概念
+
+* 協程（coroutine）允許函式中間暫停與恢復
+* 常用於 async IO、資料流處理、懶惰生成器（lazy generator）
+
+協程需要三個關鍵元素：
+
+* `promise_type`：協程狀態的持有者與控制器
+* `co_await` / `co_yield`：控制暫停與輸出
+* `std::coroutine_handle`：協程執行控制器
+
+---
+
+## 二、使用 co\_yield 建立 Generator
+
+### 簡化版 Generator 範例：
+
+```cpp
+#include <coroutine>
+#include <iostream>
+#include <optional>
+
+template<typename T>
+struct Generator {
+    struct promise_type;
+    using handle_type = std::coroutine_handle<promise_type>;
+
+    struct promise_type {
+        T current_value;
+        std::suspend_always yield_value(T value) {
+            current_value = value;
+            return {};
+        }
+        std::suspend_always initial_suspend() { return {}; }
+        std::suspend_always final_suspend() noexcept { return {}; }
+        Generator get_return_object() {
+            return Generator{handle_type::from_promise(*this)};
+        }
+        void return_void() {}
+        void unhandled_exception() { std::exit(1); }
+    };
+
+    handle_type h;
+    Generator(handle_type h) : h(h) {}
+    ~Generator() { if (h) h.destroy(); }
+
+    bool next() { return h.resume(), !h.done(); }
+    T value() const { return h.promise().current_value; }
+};
+
+Generator<int> count_up_to(int n) {
+    for (int i = 1; i <= n; ++i)
+        co_yield i;
+}
+
+int main() {
+    auto gen = count_up_to(5);
+    while (gen.next()) {
+        std::cout << gen.value() << " ";
+    }
+}
+```
+
+### 說明：
+
+* `handle_type = std::coroutine_handle<promise_type>` 是一個控制協程的物件，能讓我們 resume() 或 destroy()。
+* `handle_type::from_promise(*this)` 表示從 promise 中取得對應的 coroutine handle。
+* `promise_type` 負責暫存值與控制協程流程。
+
+> 💡 若把 `co_yield` 拿掉，整個協程不再有暫停點，會直接執行到底，無法逐步控制或查詢每個值。這就是 `co_yield` 的價值 —— 允許中途暫停、一次只處理一個值。
+
+---
+
+## 三、為何使用 co\_yield？哪些事情非用不可？
+
+### ✅ 使用 co\_yield 的最佳情境：
+
+| 情境                       | 優勢                      | 傳統寫法困難點              |
+| ------------------------ | ----------------------- | -------------------- |
+| 懶惰生成大量資料（如斐波那契數列）        | `co_yield` 可暫停函式並保存內部狀態 | 傳統需自行維護狀態變數與迴圈指標     |
+| UI event 或 stream 資料逐筆處理 | 可用 `next()` 逐步取資料       | 傳統 callback 或狀態機邏輯複雜 |
+| 實作 iterator-like 類別      | 自動管理生命周期與狀態跳躍           | 傳統需寫繁瑣的類別與 operator  |
+
+### 🧠 範例比較：斐波那契產生器
+
+#### co\_yield 寫法：
+
+```cpp
+Generator<int> fib(int max) {
+    int a = 0, b = 1;
+    while (a <= max) {
+        co_yield a;
+        std::tie(a, b) = std::make_pair(b, a + b);
+    }
+}
+```
+
+#### 傳統寫法：
+
+```cpp
+struct Fib {
+    int a = 0, b = 1;
+    int next() {
+        int temp = a;
+        std::tie(a, b) = std::make_pair(b, a + b);
+        return temp;
+    }
+};
+```
+
+#### 呼叫端差異：
+
+```cpp
+// 使用 Generator 的方式
+auto g = fib(20);
+while (g.next()) {
+    std::cout << g.value() << " ";
+}
+
+// 使用 struct 的方式
+Fib f;
+for (int i = 0; i < 10; ++i) {
+    std::cout << f.next() << " ";
+}
+```
+
+### 📘 什麼是「懶惰生成」（lazy generation）？
+
+* 指的是「等你需要某個資料時才產生它，而不是一次產生所有資料」。
+* 可以節省記憶體與運算量，特別適合用於處理無限序列、龐大檔案、streaming data。
+
+---
+
+## 四、效能比較說明
+
+| 項目      | 傳統手寫 `struct`   | `co_yield` 協程           |
+| ------- | --------------- | ----------------------- |
+| ✨ 語法簡潔  | ❌（需寫 next()、狀態） | ✅（直接寫邏輯 + 暫停）           |
+| 💡 可維護性 | ❌（難維護、易錯）       | ✅（類似寫普通函式）              |
+| 🚀 執行效能 | ✅ 較快（無額外控制機制）   | ❌ 稍慢（需維護協程狀態）           |
+| 🧠 狀態維持 | 手動變數維護          | 自動透過 promise/context 保存 |
+
+對於高頻次呼叫（例如上百萬次），傳統 struct 效能可能更高；但若偏好程式碼簡潔、清楚、可抽換協程處理，`co_yield` 更具優勢。
+
+---
+
+## 五、應用場景
+
+* 非同步資料來源的懶惰遍歷
+* stream 處理（如 network stream）
+* UI event 處理
+
+---
+
+## 六、練習題（Practice）
+
+### 題目一
+
+撰寫一個協程產生器 `even_numbers(n)`，每次 `next()` 回傳偶數直到 n。
+
+### 題目二
+
+修改 Generator 範例，使其能支援 `co_yield string` 並輸出一連串單字。
+
+### 題目三
+
+撰寫一段程式，使用傳統 struct 實作斐波那契產生器，並與 `Generator` 版本進行比較。請在 caller 端觀察兩者的使用差異與簡潔度差異。
+
+# Chapter 11: C++ 容器底層原理與效能分析
+
+本章將深入探討 C++ 標準容器的內部實作原理，並對比不同容器在各種使用情境下的效能表現，協助你作出更合適的選擇。
+
+---
+
+## 一、vector 的底層結構與擴容
+
+* `std::vector` 是連續記憶體配置（如 C 陣列）
+* 當容量不足時，會自動分配新空間並搬移資料
+* 時間複雜度：
+
+  * 隨機存取：O(1)
+  * push\_back：平均 O(1)，最壞 O(n)
+  * 插入/刪除中間：O(n)
+
+### 範例：觀察容量成長
+
+```cpp
+std::vector<int> v;
+for (int i = 0; i < 100; ++i) {
+    v.push_back(i);
+    std::cout << "size: " << v.size() << ", capacity: " << v.capacity() << std::endl;
+}
+```
+
+---
+
+## 二、list 與 forward\_list
+
+* `std::list` 是雙向鏈結串列，適合頻繁插入/刪除
+* `std::forward_list` 是單向鏈結串列，記憶體更省
+* 插入/刪除：O(1)
+* 存取：O(n)
+
+### 使用時機：
+
+* 不需要隨機存取，只需要大量插入/刪除
+* 例如：任務排程器、編輯器行列表
+
+---
+
+## 三、set、map vs unordered\_set、unordered\_map
+
+| 類型                                | 是否排序 | 底層實作         | 平均查找     | 最壞查找       |
+| --------------------------------- | ---- | ------------ | -------- | ---------- |
+| `set` / `map`                     | 有序   | 紅黑樹（RB-tree） | O(log n) | O(log n)   |
+| `unordered_set` / `unordered_map` | 無序   | hash table   | O(1)     | O(n)（碰撞嚴重） |
+
+### 注意事項：
+
+* `unordered_map` 不保證元素順序
+* Hash 函式與 Load Factor 會影響效能與碰撞率
+
+---
+
+## 四、效能選擇建議表
+
+| 使用情境              | 建議容器                             |
+| ----------------- | -------------------------------- |
+| 快速查找/加入/刪除        | `unordered_map`, `unordered_set` |
+| 順序敏感、需排序          | `vector`, `map`, `set`           |
+| 插入/刪除頻繁           | `list`, `forward_list`           |
+| 大量 push\_back 並保序 | `vector` + 預先 `reserve()`        |
+
+---
+
+## 五、練習題（Practice）
+
+### 題目一
+
+撰寫程式比較 `std::vector` 與 `std::list` 在尾端插入 1,000,000 個元素所需時間。
+
+### 題目二
+
+用 `unordered_map` 儲存英文單字對應出現次數，並統計一篇文章中 top 5 常見單字。
+
+### 題目三
+
+建立一個 task queue，使用 `list` 管理任務物件，支援中間插入與刪除。
+
+# Chapter 12: 現代 C++ 設計模式實作
+
+本章將以 Modern C++ 為基礎，實作幾個經典設計模式，並展示如何運用 lambda、smart pointer、variant、template 等語法寫出簡潔且安全的結構。
+
+---
+
+## 一、策略模式（Strategy Pattern）
+
+### 傳統做法：使用虛擬類別
+
+```cpp
+struct Strategy {
+    virtual void execute() = 0;
+    virtual ~Strategy() = default;
+};
+
+struct StrategyA : Strategy {
+    void execute() override { std::cout << "Strategy A\n"; }
+};
+```
+
+### Modern C++：使用 `std::function`
+
+```cpp
+#include <functional>
+
+std::function<void()> strategy;
+strategy = [] { std::cout << "Strategy A\n"; };
+strategy();
+```
+
+---
+
+## 二、觀察者模式（Observer Pattern）
+
+### 使用 `std::function` 與 `vector` 管理訂閱者：
+
+```cpp
+class Event {
+    std::vector<std::function<void(int)>> subscribers;
+public:
+    void subscribe(std::function<void(int)> cb) {
+        subscribers.push_back(cb);
+    }
+    void notify(int value) {
+        for (auto& cb : subscribers) cb(value);
+    }
+};
+```
+
+---
+
+## 三、狀態模式（State Pattern） + `variant`
+
+### 使用 `std::variant` 搭配狀態類別
+
+```cpp
+struct Idle { void handle() { std::cout << "Idle\n"; } };
+struct Running { void handle() { std::cout << "Running\n"; } };
+using State = std::variant<Idle, Running>;
+
+std::visit([](auto& state) { state.handle(); }, state);
+```
+
+---
+
+## 四、工廠模式（Factory Pattern）
+
+### 使用 `std::map<string, function<unique_ptr<Base>()>>`
+
+```cpp
+class Base { public: virtual void run() = 0; };
+class Derived1 : public Base { public: void run() override { std::cout << "D1\n"; }};
+
+std::map<std::string, std::function<std::unique_ptr<Base>()>> registry;
+registry["d1"] = [] { return std::make_unique<Derived1>(); };
+```
+
+---
+
+## 五、練習題（Practice）
+
+### 題目一
+
+實作策略模式，根據使用者選擇切換不同數學運算（加減乘除）。
+
+### 題目二
+
+撰寫一個 `Event` 類別，允許多個訂閱者印出事件值。
+
+### 題目三
+
+設計一個角色狀態系統，根據目前狀態印出不同訊息，使用 `std::variant` 表示狀態。
+
+# Chapter 13: 測試與例外處理
+
+本章介紹 Modern C++ 中的錯誤處理機制與基本單元測試觀念，幫助你撰寫更穩定與可驗證的程式。
+
+---
+
+## 一、例外處理（Exception Handling）
+
+### 基本語法：
+
+```cpp
+try {
+    // 潛在例外的程式碼
+} catch (const std::exception& e) {
+    std::cerr << "Error: " << e.what() << std::endl;
+}
+```
+
+### 常見標準例外：
+
+* `std::runtime_error`
+* `std::invalid_argument`
+* `std::out_of_range`
+
+### 自訂例外類別：
+
+```cpp
+class MyError : public std::exception {
+    const char* what() const noexcept override {
+        return "My custom error";
+    }
+};
+```
+
+---
+
+## 二、錯誤處理最佳實務
+
+| 情境     | 建議做法                                       |
+| ------ | ------------------------------------------ |
+| 非致命錯誤  | 使用 `std::optional`, `std::expected`（C++23） |
+| 可恢復錯誤  | 回傳錯誤碼或狀態 enum                              |
+| 無法預測錯誤 | 使用 `throw` 與 `try/catch`                   |
+
+---
+
+## 三、斷言與防衛式程式設計
+
+### 使用 `assert`
+
+```cpp
+#include <cassert>
+assert(x > 0); // 若條件不滿足則中止程式
+```
+
+* 僅於 Debug 模式啟用
+* 適合檢查邏輯假設、前置條件
+
+---
+
+## 四、單元測試：基本原則與範例
+
+### 手動測試範例：
+
+```cpp
+int add(int a, int b) { return a + b; }
+void test_add() {
+    assert(add(2, 3) == 5);
+    assert(add(-1, 1) == 0);
+    std::cout << "test_add passed\n";
+}
+```
+
+### 使用簡易測試框架（doctest / Catch2）
+
+```cpp
+#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#include "doctest.h"
+
+int add(int a, int b) { return a + b; }
+
+TEST_CASE("addition") {
+    CHECK(add(2, 2) == 4);
+    CHECK(add(-1, 1) == 0);
+}
+```
+
+---
+
+## 五、練習題（Practice）
+
+### 題目一
+
+撰寫一個 `divide(int a, int b)` 函數，當 b 為 0 時拋出例外。
+
+### 題目二
+
+設計一個簡單單元測試函數，驗證 `isEven(int)` 是否正確處理奇偶數。
+
+
+# Chapter 14: Modern C++ 與效能優化實踐
+
+本章介紹 Modern C++ 提供的效能優化工具與思維，協助你寫出高效能、低資源消耗的程式。
+
+---
+
+## 一、Move Semantics（移動語意）
+
+### 差異比較：複製 vs 移動
+
+```cpp
+std::vector<int> a = {1, 2, 3};
+std::vector<int> b = a;        // 複製（deep copy）
+std::vector<int> c = std::move(a); // 移動（no copy, steal resource）
+```
+
+* 避免不必要的複製，提升效能
+* 移動建構子、移動指派運算子：以 rvalue ref（T&&）實作
+
+---
+
+## 二、`emplace` vs `insert`/`push_back`
+
+* `push_back(obj)`：複製或移動 obj
+* `emplace_back(args...)`：原地建構物件
+
+### 範例：
+
+```cpp
+std::vector<std::pair<int, std::string>> v;
+v.emplace_back(1, "hello"); // 直接建構 pair<int, string>
+```
+
+---
+
+## 三、Inline Function 與 Header-only Library
+
+* `inline` 函式建議給小型頻繁呼叫的函式
+* Header-only 實作可減少函式呼叫開銷，編譯器可最佳化
+* 注意過度 `inline` 可能造成程式碼膨脹（code bloat）
+
+---
+
+## 四、Memory Allocation 與 Cache Awareness
+
+* 頻繁 new/delete 將降低效能，應盡量使用 stack 變數或記憶體池
+* `std::vector` 為連續記憶體，可提升 cache 命中率
+* 使用 `reserve()` 預留空間可減少 realloc 次數
+
+---
+
+## 五、`constexpr` 與編譯期最佳化
+
+* `constexpr` 函式可於編譯期運算
+* 常用於數學運算、預設值、自動生成表格等
+
+### 範例：
+
+```cpp
+constexpr int square(int x) { return x * x; }
+static_assert(square(5) == 25);
+```
+
+---
+
+## 六、練習題（Practice）
+
+### 題目一
+
+比較 `push_back` 與 `emplace_back` 的效能差異，對 10^6 個 string 加入 vector。
+
+### 題目二
+
+實作一個類別，並提供自訂的移動建構子與移動指派運算子，觀察其呼叫行為。
+
+### 題目三
+
+寫一個 `constexpr` 函式計算階乘，並於編譯期驗證結果。
+
+# Chapter 15: Modern C++ 語言功能補遺與進階應用
+
+本章收錄前面章節未完整涵蓋的重要 Modern C++ 技術與進階語法，補齊實務開發常用的語言特性，包括 `std::move`、atomic 操作、mutable 修飾、Concepts、Ranges 擴充用法、左值與右值引用、以及平行標準演算法。
+
+---
+
+## 一、std::move 與右值引用（rvalue reference）
+
+### 語意
+
+* `std::move(x)` 其實是轉型為 `T&&`，並不會真的移動，只是允許呼叫移動建構子。
+
+```cpp
+std::string a = "hello";
+std::string b = std::move(a); // b 取得資源，a 變成空字串
+```
+
+---
+
+## 二、std::atomic 與資料競爭避免
+
+* `std::atomic<T>` 可保證多執行緒對變數操作的原子性
+* 常用於簡單的旗標、計數器、lock-free queue
+
+```cpp
+std::atomic<int> counter = 0;
+
+std::thread t1([&]() { for (int i = 0; i < 1000; ++i) counter++; });
+std::thread t2([&]() { for (int i = 0; i < 1000; ++i) counter++; });
+t1.join(); t2.join();
+std::cout << counter << std::endl; // 正確為 2000
+```
+
+---
+
+## 三、mutable 修飾符
+
+* 用於 `const` 成員函式中允許特定資料成員被修改
+
+```cpp
+class Timer {
+    mutable int count = 0;
+public:
+    void tick() const { count++; } // 合法
+};
+```
+
+---
+
+## 四、Concepts 與型別約束（C++20）
+
+* 取代舊式 `enable_if`，使 template 條件更直觀
+
+```cpp
+template<typename T>
+concept Integral = std::is_integral_v<T>;
+
+template<Integral T>
+T square(T x) { return x * x; }
+```
+
+---
+
+## 五、Ranges 擴充應用
+
+```cpp
+#include <ranges>
+#include <algorithm>
+
+std::vector<int> v = {1, 2, 3, 4, 5};
+auto result = v | std::views::filter([](int x){ return x % 2 == 0; })
+                | std::views::transform([](int x){ return x * x; });
+for (int x : result) std::cout << x << " ";
+```
+
+---
+
+## 六、左值、右值引用與傳遞方式理解
+
+| 語法         | 意義               |
+| ---------- | ---------------- |
+| `T&`       | 左值引用（lvalue ref） |
+| `T&&`      | 右值引用（rvalue ref） |
+| `const T&` | 接受左值與右值但不可修改     |
+
+### 完美轉發（forwarding）
+
+```cpp
+template<typename T>
+void wrapper(T&& arg) {
+    process(std::forward<T>(arg));
+}
+```
+
+---
+
+## 七、平行演算法與 std::execution
+
+### 平行 transform（C++17 + execution）
+
+```cpp
+#include <execution>
+#include <algorithm>
+std::vector<int> data = {1,2,3,4,5};
+std::vector<int> result(5);
+
+std::transform(std::execution::par, data.begin(), data.end(), result.begin(),
+               [](int x){ return x * x; });
+```
+
+---
+
+## 練習題（Practice）
+
+### 題目一
+
+撰寫一個 `Timer` 類別，記錄呼叫次數但介面為 `const`，使用 `mutable` 實作。
+
+### 題目二
+
+使用 `concept` 寫一個泛型 `print()` 函式，只允許容器類型印出元素。
+
+### 題目三
+
+使用 `std::execution::par` 對一組大型整數 vector 進行平方轉換，測量與序列版差異。
